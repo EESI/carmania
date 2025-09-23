@@ -36,75 +36,156 @@ except Exception:
     HAVE_FLASH_ATTN = False
 
 
-def _sdpa_flash_attn_compat(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    causal: bool = True,
-    window_size: Optional[Tuple[int, int]] = None,
+
+def _repeat_kv_for_gqa(x: torch.Tensor, repeat: int) -> torch.Tensor:
+    # x: [B, S, Hk, D] -> [B, S, Hq, D], where Hq = Hk * repeat
+    if repeat == 1:
+        return x
+    B, S, Hk, D = x.shape
+    x = x.unsqueeze(2).expand(B, S, repeat, Hk, D)   # [B,S,repeat,Hk,D]
+    return x.reshape(B, S, repeat * Hk, D)
+
+@torch.no_grad()
+def _build_window_mask(
+    Sq: int, Sk: int, left: int, right: int, causal: bool, device: torch.device
 ) -> torch.Tensor:
     """
-    Compatibility wrapper that emulates ``flash_attn_func`` using PyTorch's
-    built–in scaled dot product attention.  It accepts query, key, and value
-    tensors with shape ``[batch, seq_len, num_heads, head_dim]`` and returns an
-    output tensor of the same shape.  When ``window_size`` is provided a banded
-    local attention mask is applied in combination with a causal mask.
-
-    Parameters
-    ----------
-    q, k, v : torch.Tensor
-        Input tensors shaped as (B, S, H, D).  Internally these will be
-        transposed to (B, H, S, D) for PyTorch's SDPA API.
-    causal : bool, optional
-        Whether to apply a causal (upper triangular) mask to prevent attending
-        to future positions.  Defaults to ``True``.
-    window_size : tuple of two ints, optional
-        If provided, this denotes a symmetric window around each position.  A
-        tuple ``(left, right)`` means each position can attend to at most
-        ``left`` tokens to its left and ``right`` tokens to its right.  When
-        supplied the causal mask is merged with the band mask.
-
-    Returns
-    -------
-    torch.Tensor
-        Output tensor with shape (B, S, H, D).
+    FA2 window semantics:
+      valid j for query i: j ∈ [ i + Sk - Sq - left, i + Sk - Sq + right ]
+    FA2.1 causal alignment (bottom-right): additionally disallow j > i + Sk - Sq
+    Return: float mask [1,1,Sq,Sk] with 0 for keep, -inf for mask.
     """
-    # Convert from [B, S, H, D] to [B, H, S, D] for SDPA.
-    qh = q.permute(0, 2, 1, 3)
-    kh = k.permute(0, 2, 1, 3)
-    vh = v.permute(0, 2, 1, 3)
-    seq_len = q.shape[1]
-    attn_mask = None
-    # Build an attention mask if a window is specified.
-    if window_size is not None:
-        left, right = window_size
-        # Create a banded mask of allowed positions.  ``True`` indicates a
-        # position should be masked out.  Shape: [S, S].
-        device = q.device
-        ar = torch.arange(seq_len, device=device)
-        i = ar.view(-1, 1)
-        j = ar.view(1, -1)
-        band = (j >= (i - left)) & (j <= (i + right))
-        mask = ~band  # invert to mark positions outside the band.
-        if causal:
-            # Combine with a standard causal mask.
-            causal_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device).triu(1)
-            mask = mask | causal_mask
-        attn_mask = mask
-        # When we provide an attention mask PyTorch's SDPA expects
-        # is_causal=False; the mask encodes causality explicitly.
-        causal = False
-    # Use scaled_dot_product_attention.  This API supports dropout, but we set
-    # dropout_p=0.0 to mirror flash attention's inference behaviour.
+    i = torch.arange(Sq, device=device).view(-1, 1)  # [Sq,1]
+    j = torch.arange(Sk, device=device).view(1, -1)  # [1,Sk]
+    shift = Sk - Sq
+    j_min = i + shift - left
+    j_max = i + shift + right
+    allowed = (j >= j_min) & (j <= j_max)
+    if causal:
+        # forbid looking ahead relative to FA2.1 alignment
+        allowed &= (j <= (i + shift))
+    masked = ~allowed
+    m = torch.full((Sq, Sk), 0.0, device=device)
+    m[masked] = -torch.finfo(m.dtype).max  # -inf
+    return m.view(1, 1, Sq, Sk).contiguous()
+
+@torch.no_grad()
+def _build_causal_mask_fa21(
+    Sq: int, Sk: int, device: torch.device
+) -> torch.Tensor:
+    """
+    FA2.1 causal only (no window): mask positions with j > i + (Sk - Sq).
+    Returns float mask [1,1,Sq,Sk] with 0 keep, -inf mask.
+    """
+    i = torch.arange(Sq, device=device).view(-1, 1)
+    j = torch.arange(Sk, device=device).view(1, -1)
+    shift = Sk - Sq
+    allowed = (j <= (i + shift))
+    masked = ~allowed
+    m = torch.full((Sq, Sk), 0.0, device=device)
+    m[masked] = -torch.finfo(m.dtype).max
+    return m.view(1, 1, Sq, Sk).contiguous()
+
+def _sdpa_flash_attn_compat(
+    q: torch.Tensor,  # [B,Sq,Hq,D]
+    k: torch.Tensor,  # [B,Sk,Hk,D]
+    v: torch.Tensor,  # [B,Sk,Hk,D]
+    *,
+    dropout_p: float = 0.0,
+    softmax_scale: Optional[float] = None,    # default 1/sqrt(D) if None
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),  # (-1,-1) == no window
+    alibi_slopes: Optional[torch.Tensor] = None,  # (Hq,) or (B,Hq)
+    training: Optional[bool] = None,
+) -> torch.Tensor:
+    """
+    SDPA path emulating flash_attn_func semantics (v2):
+      - supports GQA (Hq divisible by Hk)
+      - FA2.1 causal alignment when Sq != Sk
+      - sliding window: j in [i + Sk - Sq - left, i + Sk - Sq + right]
+      - ALiBi additive bias
+    Returns: [B,Sq,Hq,D] with original dtype.
+    """
+    assert q.dim() == k.dim() == v.dim() == 4, "Expect [B,S,H,D] tensors"
+    B, Sq, Hq, D = q.shape
+    Bk, Sk, Hk, Dk = k.shape
+    assert (Bk, Sk, Dk) == (B, k.shape[1], D), "Batch/Dim mismatch"
+    assert v.shape[:3] == k.shape[:3] and v.shape[3] == D, "K/V mismatch"
+    assert Hq % Hk == 0, "Hq must be divisible by Hk for GQA/MQA"
+    repeat = Hq // Hk
+
+    # GQA: expand K,V heads to match Q heads so SDPA sees [B,Hq,*,D]
+    k_exp = _repeat_kv_for_gqa(k, repeat)  # [B,Sk,Hq,D]
+    v_exp = _repeat_kv_for_gqa(v, repeat)  # [B,Sk,Hq,D]
+
+    # layout for SDPA: [B,H,S,D]
+    qh = q.permute(0, 2, 1, 3).to(torch.float32)     # [B,Hq,Sq,D]
+    kh = k_exp.permute(0, 2, 1, 3).to(torch.float32) # [B,Hq,Sk,D]
+    vh = v_exp.permute(0, 2, 1, 3).to(torch.float32) # [B,Hq,Sk,D]
+    in_dtype = q.dtype
+    device = q.device
+
+    # softmax scale: default 1/sqrt(D); emulate custom s by scaling Q by s*sqrt(D)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(D)
+    qh = qh * (softmax_scale * math.sqrt(D))
+
+    # Build float mask (+ALiBi) as additive bias; pass is_causal=False to SDPA.
+    left, right = window_size
+    use_window = (left, right) != (-1, -1)
+    attn_bias = None  # [B,Hq,Sq,Sk] float, 0 for keep, -inf for mask, +ALiBi
+
+    if use_window:
+        # Per FA2 semantics; also clamp look-ahead under causal
+        if causal and right > 0:
+            right = 0
+        base = _build_window_mask(Sq, Sk, left, right, causal, device)  # [1,1,Sq,Sk]
+        attn_bias = base.expand(B, Hq, Sq, Sk)
+        is_causal = False
+    elif causal:
+        base = _build_causal_mask_fa21(Sq, Sk, device)  # [1,1,Sq,Sk]
+        attn_bias = base.expand(B, Hq, Sq, Sk)
+        is_causal = False
+    else:
+        is_causal = False
+        attn_bias = None  # fastest path
+
+    # ALiBi: add -(slope * |(i + Sk - Sq) - j|) to logits (i=0..Sq-1, j=0..Sk-1)
+    if alibi_slopes is not None:
+        # make slopes shape [B,Hq,1,1]
+        if alibi_slopes.dim() == 1:
+            # [Hq] -> [1,Hq,1,1]
+            alibi = alibi_slopes.view(1, Hq, 1, 1).to(dtype=torch.float32, device=device)
+            alibi = alibi.expand(B, Hq, 1, 1)
+        elif alibi_slopes.dim() == 2:
+            # [B,Hq] -> [B,Hq,1,1]
+            alibi = alibi_slopes.view(B, Hq, 1, 1).to(dtype=torch.float32, device=device)
+        else:
+            raise ValueError("alibi_slopes must be (Hq,) or (B,Hq)")
+        i = torch.arange(Sq, device=device).view(1, 1, -1, 1)
+        j = torch.arange(Sk, device=device).view(1, 1, 1, -1)
+        shift = Sk - Sq
+        dist = (i + shift - j).abs().to(torch.float32)  # [1,1,Sq,Sk]
+        alibi_term = -(alibi * dist)                     # [B,Hq,Sq,Sk]
+        if attn_bias is None:
+            attn_bias = alibi_term
+        else:
+            attn_bias = attn_bias + alibi_term
+
+    # Dropout (train) vs eval
+    if training is None:
+        training = (dropout_p > 0.0) and any(t.requires_grad for t in (q, k, v))
+    dp = dropout_p if training else 0.0
+
     out = F.scaled_dot_product_attention(
         qh, kh, vh,
-        attn_mask=attn_mask,
-        dropout_p=0.0,
-        is_causal=causal,
-    )  # shape: [B, H, S, D]
-    # Convert back to [B, S, H, D].
-    return out.permute(0, 2, 1, 3).contiguous()
+        attn_mask=attn_bias,   # float additive mask/bias or None
+        dropout_p=dp,
+        is_causal=is_causal,   # we encode causal via mask/bias when needed
+    )  # [B,Hq,Sq,D] fp32
+
+    return out.permute(0, 2, 1, 3).to(in_dtype).contiguous()  # [B,Sq,Hq,D]
+
 
 
 def _attn_dispatch(
