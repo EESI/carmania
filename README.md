@@ -27,9 +27,20 @@ The following models are already available for use on [Hugging Face Hub](https:/
 
 ```python
 from transformers import AutoModel, AutoTokenizer
+import torch
 
-model = AutoModel.from_pretrained("MsAlEhR/carmania-160k-seqlen-human", trust_remote_code=True)
-tokenizer = AutoTokenizer.from_pretrained("MsAlEhR/carmania-160k-seqlen-human", trust_remote_code=True)
+model = AutoModel.from_pretrained(
+    "MsAlEhR/carmania-160k-seqlen-human",
+    trust_remote_code=True,
+    torch_dtype=torch.float16,   # fixed dtype (or autocast)
+).to("cuda")
 
-inputs = tokenizer("ACGTAGGCTA...", return_tensors="pt")
+tokenizer = AutoTokenizer.from_pretrained(
+    "MsAlEhR/carmania-160k-seqlen-human",
+    trust_remote_code=True,
+    model_max_length=160000,
+)
+
+inputs = tokenizer("ACGTAGGCTA", return_tensors="pt").to("cuda")
+
 outputs = model(**inputs)
