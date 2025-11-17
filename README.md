@@ -53,8 +53,6 @@ This lightweight module perturbs input DNA sequences and uses Enformer’s predi
 📄 **Notebook:**  
 [carmania_enformer_guided_generation.ipynb](https://github.com/EESI/carmania/blob/main/notebooks/carmania_enformer_guided_generation.ipynb)
 
-This prototype demonstrates how CARMANIA can be extended toward **regulatory sequence generation**, using predicted chromatin-accessibility profiles as the optimization objective.
-
 
 ## Citation
 
