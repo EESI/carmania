@@ -43,3 +43,27 @@ tokenizer = AutoTokenizer.from_pretrained(
 inputs = tokenizer("ACGTAGGCTA", return_tensors="pt").to("cuda")
 
 outputs = model(**inputs)
+```
+
+## 🧪 Sequence-Guided Generation
+
+An experimental notebook exploring **CARMANIA-driven sequence optimization** using Enformer scores is now available.  
+This lightweight module perturbs input DNA sequences and uses Enformer’s predicted regulatory signals as a scoring function to iteratively generate variants with improved activity.
+
+📄 **Notebook:**  
+[carmania_enformer_guided_generation.ipynb](https://github.com/EESI/carmania/blob/main/notebooks/carmania_enformer_guided_generation.ipynb)
+
+This prototype demonstrates how CARMANIA can be extended toward **regulatory sequence generation**, using predicted chromatin-accessibility profiles as the optimization objective.
+
+
+## Citation
+
+```bibtex
+@article{refahi2025context,
+  title= {Context-Aware Regularization with Markovian Integration for Attention-Based Nucleotide Analysis},
+  author= {Refahi, Mohammadsaleh and Abavisani, Mahdi and Sokhansanj, Bahrad A. and Brown, James R. and Rosen, Gail},
+  journal= {arXiv preprint arXiv:2507.09378},
+  year= {2025}
+}
+
+
