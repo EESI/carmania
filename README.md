@@ -57,11 +57,13 @@ This lightweight module perturbs input DNA sequences and uses Enformer’s predi
 ## Citation
 
 ```bibtex
-@article{refahi2025context,
-  title= {Context-Aware Regularization with Markovian Integration for Attention-Based Nucleotide Analysis},
-  author= {Refahi, Mohammadsaleh and Abavisani, Mahdi and Sokhansanj, Bahrad A. and Brown, James R. and Rosen, Gail},
-  journal= {arXiv preprint arXiv:2507.09378},
-  year= {2025}
+@article{refahi2026context,
+  title={Context-aware regularization with markovian integration for attention-based nucleotide analysis},
+  author={Refahi, Mohammad Saleh and Abavisani, Mahdi and Sokhansanj, Bahrad and Brown, James R and Rosen, Gail},
+  journal={Advances in Neural Information Processing Systems},
+  volume={38},
+  pages={108518--108544},
+  year={2026}
 }
 
 
